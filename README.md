@@ -64,6 +64,31 @@ dibagikan / jangan di-commit.
 > ("Could not start the sign-in"). Itu bug mereka (terjadi juga
 > 4 & 12 Nov 2026) — coba lagi beberapa saat kemudian.
 
+## Mode cookie-env (tanpa browser, tanpa login X berulang)
+
+Tidak ada login pakai private key di situs ini — satu-satunya login di
+seluruh bundle resminya adalah `/api/x/login` (akun X + Turnstile);
+private key wallet BTC baru dipakai nanti saat *redeem* payout, bukan
+untuk login/claim mining. Kredensial yang setara "env" di sini adalah
+**cookie sesi** hasil login X itu:
+
+```bash
+# di mesin tempat kamu login (setelah login.py):
+python3 export_cookie.py        # -> cookie.env (chmod 600), isi tidak ditampilkan
+# salin isi cookie.env ke file .env di folder bot di VPS:
+#   DHORSE_COOKIE="nama=isi; nama2=isi2; ..."
+# di VPS (tanpa browser sama sekali):
+python3 dhorse_claim.py --cookie --once --dry-run
+python3 dhorse_claim.py --cookie --loop
+```
+
+Terbukti live 13 Nov 2026: cookie palsu → API menjawab **401**
+(autentikasi murni cookie). Cookie mati → bot lapor `SESI_MATI`,
+ekspor ulang sekali. Cookie = password akun: jangan dibagikan,
+jangan di-commit (`.env`/`cookie.env` masuk `.gitignore`).
+Risiko: `cf_clearance` kadang terikat IP/UA browser asal — bila VPS
+kena 403 di mode ini, pakai mode browser (`login.py`) di VPS itu.
+
 ## Jalan
 
 ```bash

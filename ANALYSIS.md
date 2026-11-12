@@ -99,6 +99,22 @@ Fakta penting dari kode UI resmi:
 - Klaim yang berhasil memanggil ulang status + `/api/me` untuk verifikasi —
   bot meniru persis pola ini.
 
+## Soal "login pakai private key" (dicek 13 Nov 2026 atas tanya Bos)
+
+Tidak bisa — dan ini sifat situsnya, bukan batas bot: pencarian di
+seluruh bundle resmi menemukan **tepat satu** endpoint login,
+`/api/x/login`, dan **nol** kemunculan `signMessage`, `nonce`,
+`privateKey`, `mnemonic`, `walletLogin`. Kata "signature" hanya muncul
+pada konteks *redeem*: payout token nanti diklaim dengan tanda tangan
+dari wallet alamat BTC yang terikat ("the platform honors that
+signature, not your account") — peringatan situs sendiri: mining di
+alamat orang lain = hasilmu bisa diklaim pemilik alamat itu. Jadi
+private key di env tidak membuka login apa pun, dan menaruhnya di
+server hanya menambah risiko kehilangan payout kelak.
+Kredensial portabel yang benar adalah cookie sesi (lihat README,
+mode `--cookie`): terbukti live 13 Nov 03:29 WIB, cookie palsu →
+`GET /api/mining/status` menjawab 401.
+
 ## Unknown (sisa, jujur)
 
 - Nama & umur pasti cookie sesi login X (httpOnly, tidak terbaca dari

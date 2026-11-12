@@ -549,6 +549,122 @@ def selftest() -> int:
     return 0
 
 
+# ------------------------------------------------------- mode cookie-env
+# Alternatif tanpa browser & tanpa login X berulang di VPS:
+# kredensialnya BUKAN private key (situs tidak punya login private key /
+# signature sama sekali — satu-satunya login di bundle resminya adalah
+# /api/x/login), melainkan COOKIE SESI hasil login X itu sendiri.
+# Ambil sekali dengan export_cookie.py (atau salin header Cookie dari
+# browser kamu sendiri), taruh di .env VPS:  DHORSE_COOKIE="name=...; ..."
+# Cookie = kata sandi akunmu. Jangan dibagikan, jangan di-commit
+# (.env sudah masuk .gitignore), chmod 600.
+# Catatan: cookie cf_clearance dari Cloudflare kadang terikat IP/UA
+# browser asal — bila mode ini menjawab 403, pakai mode browser biasa
+# (profil persisten) yang kebal masalah itu.
+
+ENV_FILE = os.path.join(HERE, ".env")
+COOKIE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+             "AppleWebKit/537.36 (KHTML, like Gecko) "
+             "Chrome/130.0.0.0 Safari/537.36")
+
+
+def load_cookie() -> str | None:
+    c = os.environ.get("DHORSE_COOKIE", "").strip()
+    if c:
+        return c
+    if os.path.exists(ENV_FILE):
+        try:
+            with open(ENV_FILE, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("DHORSE_COOKIE="):
+                        v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if v:
+                            return v
+        except OSError:
+            pass
+    return None
+
+
+def _http_api(cookie: str, method: str, path: str, body: bytes | None = None):
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(BASE + path, data=body, method=method)
+    req.add_header("Cookie", cookie)
+    req.add_header("User-Agent", COOKIE_UA)
+    req.add_header("Accept", "application/json")
+    req.add_header("Referer", MINE_URL)
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Origin", BASE)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            try:
+                return resp.status, json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                return resp.status, {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace") if e.fp else ""
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            parsed = {}
+        return e.code, parsed
+    except Exception as e:
+        return 0, {"error": f"NETWORK: {e}"}
+
+
+def run_cookie_cycle(cookie: str, do_claim: bool, min_claim: float) -> MineState | None:
+    status, body = _http_api(cookie, "GET", "/api/mining/status")
+    if status == 401:
+        log("SESI_MATI (cookie): /api/mining/status 401 — cookie sesi habis/dicabut. "
+            "Ambil cookie baru sekali lewat export_cookie.py, perbarui .env. Bot tidak login sendiri.")
+        return MineState(logged_in=False)
+    if status == 403:
+        log("BLOCKER (cookie): 403 dari Cloudflare — cookie dari browser lain kemungkinan "
+            "tidak cocok dengan IP/UA VPS ini (cf_clearance). Pakai mode browser (login.py) di VPS ini.")
+        return None
+    if status != 200 or not isinstance(body, dict) or "claimable" not in body:
+        log(f"BLOCKER (cookie): status HTTP {status} body={str(body)[:200]}")
+        return None
+    st = parse_status_json(body)
+    log(f"state(cookie): claimable={st.claimable} blocksLeft={st.blocks_left()} "
+        f"tip={st.tip_height} dailyRate={st.daily_rate} claimed={st.claimed_total} ({st.raw_found.strip()})")
+    est_end = next_round_end_estimate()
+    mins_to_est_end = (est_end - datetime.now(WIB)).total_seconds() / 60.0
+    urgent = (st.blocks_left() is not None and st.blocks_left() <= 6) or mins_to_est_end <= 45
+    if st.claimable is None:
+        log("PARSE_GAGAL (cookie): claimable tidak ada di respons status.")
+        return st
+    if st.claimable >= min_claim:
+        if not do_claim:
+            log(f"DRY-RUN (cookie): claimable {st.claimable} >= {min_claim} — seharusnya CLAIM"
+                f"{' (URGENT)' if urgent else ''}. Tidak dikirim.")
+            return st
+        c_status, c_body = _http_api(cookie, "POST", "/api/mining/claim", body=b"{}")
+        if c_status == 200 and isinstance(c_body, dict) and isinstance(c_body.get("claimed"), (int, float)):
+            log(f"CLAIM_BERHASIL_API (cookie): +{c_body['claimed']} Horseshoes masuk akun.")
+            s2, b2 = _http_api(cookie, "GET", "/api/mining/status")
+            if s2 == 200 and isinstance(b2, dict) and "claimable" in b2:
+                st2 = parse_status_json(b2)
+                log(f"status sesudah claim: claimable={st2.claimable} blocksLeft={st2.blocks_left()}")
+                return st2
+            return st
+        code = c_body.get("error") if isinstance(c_body, dict) else None
+        if code == "FROZEN":
+            log("BLOCKER: akun FROZEN menurut API claim. Berhenti mengklaim; cek akun di situs.")
+            return st
+        log(f"CLAIM_GAGAL (cookie): HTTP {c_status} error={code} body={str(c_body)[:200]}")
+        return st
+    if st.claimable > 0 and urgent:
+        log(f"INFO (cookie): claimable {st.claimable} < minimum {min_claim} dan ronde mau habis — "
+            "pecahan <1 belum bisa di-claim menurut aturan situs.")
+    else:
+        log(f"Belum claim (cookie): claimable {st.claimable} < {min_claim}. Aman.")
+    return st
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> int:
@@ -561,6 +677,8 @@ def main() -> int:
     ap.add_argument("--min-claim", type=float, default=1.0, help="minimum claimable untuk claim (default 1.0, minimum situs)")
     ap.add_argument("--interval", type=int, default=300, help="tempo dasar polling detik (default 300)")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--cookie", action="store_true",
+                    help="mode HTTP murni memakai DHORSE_COOKIE dari env/.env (tanpa browser)")
     args = ap.parse_args()
 
     if args.selftest:
@@ -570,6 +688,31 @@ def main() -> int:
         args.min_claim = 1.0
     if not args.once and not args.loop:
         args.once = True
+
+    if args.cookie:
+        cookie = load_cookie()
+        if not cookie:
+            log("BLOCKER (cookie): DHORSE_COOKIE belum di-set. Taruh di .env folder ini: "
+                "DHORSE_COOKIE=\"<header Cookie dari sesi loginmu>\" — ambil sekali via export_cookie.py. "
+                "Ingat: cookie = kredensial akun, perlakukan seperti password.")
+            return 2
+        while True:
+            st = run_cookie_cycle(cookie, do_claim=not args.dry_run, min_claim=args.min_claim)
+            if args.once:
+                return 0
+            if st is not None and not st.logged_in:
+                log("Loop cookie berhenti: sesi mati.")
+                return 2
+            sleep_s = args.interval
+            if st is not None:
+                bl = st.blocks_left()
+                mins_est = (next_round_end_estimate() - datetime.now(WIB)).total_seconds() / 60.0
+                if (bl is not None and bl <= 6) or mins_est <= 60:
+                    sleep_s = 60
+                if mins_est <= 15:
+                    sleep_s = 30
+            log(f"Tidur {sleep_s} dtk ...")
+            time.sleep(sleep_s)
 
     bot = ClaimBot(headless=not args.headed, inspect=args.inspect)
     while True:

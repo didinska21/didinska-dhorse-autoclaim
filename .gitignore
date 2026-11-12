@@ -2,3 +2,5 @@ session/
 inspect/
 runs.log
 __pycache__/
+.env
+cookie.env
