@@ -93,6 +93,54 @@ def log(msg: str) -> None:
         pass
 
 
+def log_block(lines: list[str]) -> None:
+    """Blok multi-baris rapi: baris pertama bertimestamp, sisanya menjorok
+    sejajar di bawahnya. Semua baris tetap ditulis ke runs.log."""
+    if not lines:
+        return
+    stamp = f"[{now_wib()}] "
+    out = [stamp + lines[0]] + [" " * len(stamp) + ln for ln in lines[1:]]
+    for ln in out:
+        print(ln, flush=True)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            for ln in out:
+                f.write(ln + "\n")
+    except OSError:
+        pass
+
+
+def fmt_num(x, dec: int = 4) -> str:
+    """1234567.891 -> '1,234,567.891' (nol ekor dibuang)."""
+    if x is None:
+        return "-"
+    s = f"{float(x):,.{dec}f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def bar(done: float, total: float, width: int = 20) -> str:
+    """Bar progres teks: bar(61, 72) -> '█████████████████░░░ 85%'."""
+    if not total:
+        return ""
+    frac = max(0.0, min(1.0, float(done) / float(total)))
+    fill = round(frac * width)
+    return "█" * fill + "░" * (width - fill) + f" {frac * 100:.0f}%"
+
+
+def banner(mode: str, min_claim: float, interval: int, loop: bool, dry: bool) -> None:
+    tempo = f"{interval // 60} mnt" if interval >= 60 else f"{interval} dtk"
+    log_block([
+        "╔══════════════════════════════════════════════════════════╗",
+        "║  🐴 DARKHORSE GENESIS — AUTO-CLAIM HORSESHOES            ║",
+        "╚══════════════════════════════════════════════════════════╝",
+        f"Mode {mode} · claim otomatis ≥ {fmt_num(min_claim, 1)} · cek tiap {tempo}"
+        + (" · LOOP 24 jam" if loop else " · sekali jalan")
+        + (" · ⚠️ DRY-RUN (tanpa claim)" if dry else ""),
+    ])
+
+
 # ---------------------------------------------------------------- parsing
 
 @dataclass
@@ -650,8 +698,24 @@ def run_cookie_cycle(cookie: str, do_claim: bool, min_claim: float) -> MineState
         log(f"BLOCKER (cookie): status HTTP {status} body={str(body)[:200]}")
         return None
     st = parse_status_json(body)
-    log(f"state(cookie): claimable={st.claimable} blocksLeft={st.blocks_left()} "
-        f"tip={st.tip_height} dailyRate={st.daily_rate} claimed={st.claimed_total} ({st.raw_found.strip()})")
+    _bl = st.blocks_left()
+    _burn_m = re.search(r"riwayat_burn_total=([\d.]+)", st.raw_found or "")
+    _burn = f" · 🔥 burn historis {fmt_num(float(_burn_m.group(1)), 1)}" if _burn_m else ""
+    _lines = [
+        f"🐴 Epoch {st.epoch if st.epoch is not None else '-'}"
+        + (f" · sisa {_bl} blok (±{_bl * 10} mnt)" if _bl is not None else "")
+        + f" · tip BTC {fmt_num(st.tip_height, 0)}",
+    ]
+    if _bl is not None:
+        _lines.append(f"   Ronde   {bar(72 - _bl, 72)}")
+    _lines.append(
+        f"   💰 Claimable {fmt_num(st.claimable)} Horseshoes"
+        f" · ✅ claimed {fmt_num(st.claimed_total, 1)}"
+        f" · ⚡ power {fmt_num(st.power, 0)}"
+        f" · 📈 {fmt_num(st.daily_rate, 1)}/hari{_burn}")
+    if st.claimable is not None and st.claimable < min_claim:
+        _lines.append(f"   Target  {bar(st.claimable, min_claim, 10)} menuju {fmt_num(min_claim, 1)}")
+    log_block(_lines)
     est_end = next_round_end_estimate()
     mins_to_est_end = (est_end - datetime.now(WIB)).total_seconds() / 60.0
     urgent = (st.blocks_left() is not None and st.blocks_left() <= 6) or mins_to_est_end <= 45
@@ -665,12 +729,15 @@ def run_cookie_cycle(cookie: str, do_claim: bool, min_claim: float) -> MineState
             return st
         c_status, c_body = _http_api(cookie, "POST", "/api/mining/claim", body=b"{}")
         if c_status == 200 and isinstance(c_body, dict) and isinstance(c_body.get("claimed"), (int, float)):
-            log(f"CLAIM_BERHASIL_API (cookie): +{c_body['claimed']} Horseshoes masuk akun.")
             s2, b2 = _http_api(cookie, "GET", "/api/mining/status")
             if s2 == 200 and isinstance(b2, dict) and "claimable" in b2:
                 st2 = parse_status_json(b2)
-                log(f"status sesudah claim: claimable={st2.claimable} blocksLeft={st2.blocks_left()}")
+                log_block([
+                    f"🎉 CLAIM_BERHASIL_API +{fmt_num(c_body['claimed'])} Horseshoes masuk akun!",
+                    f"   Sisa claimable {fmt_num(st2.claimable)} · total claimed {fmt_num(st2.claimed_total, 1)}",
+                ])
                 return st2
+            log(f"🎉 CLAIM_BERHASIL_API +{fmt_num(c_body['claimed'])} Horseshoes masuk akun!")
             return st
         code = c_body.get("error") if isinstance(c_body, dict) else None
         if code == "FROZEN":
@@ -679,10 +746,10 @@ def run_cookie_cycle(cookie: str, do_claim: bool, min_claim: float) -> MineState
         log(f"CLAIM_GAGAL (cookie): HTTP {c_status} error={code} body={str(c_body)[:200]}")
         return st
     if st.claimable > 0 and urgent:
-        log(f"INFO (cookie): claimable {st.claimable} < minimum {min_claim} dan ronde mau habis — "
+        log(f"   ⏰ INFO: claimable {fmt_num(st.claimable)} < minimum {fmt_num(min_claim, 1)} dan ronde mau habis — "
             "pecahan <1 belum bisa di-claim menurut aturan situs.")
     else:
-        log(f"Belum claim (cookie): claimable {st.claimable} < {min_claim}. Aman.")
+        log(f"   💤 Belum claim: {fmt_num(st.claimable)} < {fmt_num(min_claim, 1)}. Aman, nunggu genap.")
     return st
 
 
@@ -717,6 +784,8 @@ def main() -> int:
                 "DHORSE_COOKIE=\"<header Cookie dari sesi loginmu>\" — ambil sekali via export_cookie.py. "
                 "Ingat: cookie = kredensial akun, perlakukan seperti password.")
             return 2
+        banner("cookie (HTTP murni, tanpa browser)", args.min_claim, args.interval,
+               loop=args.loop, dry=args.dry_run)
         while True:
             st = run_cookie_cycle(cookie, do_claim=not args.dry_run, min_claim=args.min_claim)
             if args.once:
@@ -732,7 +801,8 @@ def main() -> int:
                     sleep_s = 60
                 if mins_est <= 15:
                     sleep_s = 30
-            log(f"Tidur {sleep_s} dtk ...")
+            _human = f"±{sleep_s // 60} mnt" if sleep_s >= 60 else f"{sleep_s} dtk"
+            log(f"⏳ Cek lagi {_human} lagi ...")
             time.sleep(sleep_s)
 
     bot = ClaimBot(headless=not args.headed, inspect=args.inspect)
