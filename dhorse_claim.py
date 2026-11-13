@@ -568,6 +568,27 @@ COOKIE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
              "Chrome/130.0.0.0 Safari/537.36")
 
 
+def load_ua() -> str:
+    """UA untuk mode cookie. cf_clearance kadang terikat UA browser asal,
+    jadi UA bisa dioverride lewat DHORSE_UA di env/.env (samakan persis
+    dengan User-Agent browser tempat cookie diambil)."""
+    u = os.environ.get("DHORSE_UA", "").strip()
+    if u:
+        return u
+    if os.path.exists(ENV_FILE):
+        try:
+            with open(ENV_FILE, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("DHORSE_UA="):
+                        v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if v:
+                            return v
+        except OSError:
+            pass
+    return COOKIE_UA
+
+
 def load_cookie() -> str | None:
     c = os.environ.get("DHORSE_COOKIE", "").strip()
     if c:
@@ -591,7 +612,7 @@ def _http_api(cookie: str, method: str, path: str, body: bytes | None = None):
     import urllib.error
     req = urllib.request.Request(BASE + path, data=body, method=method)
     req.add_header("Cookie", cookie)
-    req.add_header("User-Agent", COOKIE_UA)
+    req.add_header("User-Agent", load_ua())
     req.add_header("Accept", "application/json")
     req.add_header("Referer", MINE_URL)
     if body is not None:
