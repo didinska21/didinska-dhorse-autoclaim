@@ -5,15 +5,33 @@ Reward mining di `genesis.dhorse.fun/mine` **hangus tiap akhir ronde**
 mining dengan sesi login X kamu dan menekan **Claim** otomatis begitu
 claimable ≥ 1 Horseshoe — jadi tidak kelewat / ke-burn lagi.
 
+**Update 17 Nov 2026 — tiga tugas sekarang:**
+1. **Daily check-in** (`genesis.dhorse.fun/`) — tiap hari +20 Horseshoes.
+2. **Auto-claim mining** (`/mine`) — seperti sebelumnya.
+3. **Cek rank / power** (`/board`) — rank Horseshoes + rank power kamu
+   dilaporkan berkala di log.
+
 Analisa lengkap situsnya (gaya REA): lihat `ANALYSIS.md`.
 
 ## Cara kerja
 
 Bot memakai **API resmi situs itu sendiri** (ketemu dari JS bundle
-resminya, lihat `ANALYSIS.md`):
+resminya — bundle terbaru `index-Bse_Z7JS.js`, 17 Nov 2026, lihat
+`ANALYSIS.md`):
 
 - `GET /api/mining/status` → `claimable, blocksLeft, tipHeight, dailyRate, …`
+  (sekarang juga `networkRank, networkPower, blockSeconds`)
 - `POST /api/mining/claim` (body `{}`) → `{claimed: jumlah}`
+- `GET /api/me` → `checkinToday, checkinDays, handle, …` (state check-in)
+- `POST /api/checkin` (body `{}`) → daily check-in, **+20 Horseshoes**
+  ke pending. Bot POST hanya bila `checkinToday == false`, lalu
+  verifikasi ulang `/api/me` — persis pola UI resminya. Batas "hari"
+  mengikuti server (dibaca dari `checkinToday` tiap siklus), jadi
+  check-in tidak pernah kelewat selama loop jalan.
+- `GET /api/leaderboard` → `{rows[50], me{rank}}` (tab Horseshoes /board)
+- `GET /api/mining/network` → `{miners, totalPower, top[50]}` (tab Power)
+  — dua endpoint board ini **publik**; rank power pribadi diambil dari
+  `networkRank` di status mining.
 
 Panggilan dilakukan dari dalam halaman `/mine` yang sedang login
 (fetch same-origin, cookie sesimu sendiri — persis cara UI resminya).
@@ -27,9 +45,11 @@ status sesudahnya.
   kendalikan (login dilindungi Turnstile, memang gerbang manusia).
   Sesi tersimpan lokal di `session/` (chmod 700, masuk `.gitignore`).
   **Tidak ada password / private key / seed di bot ini.**
-- Bot **hanya** menyentuh dua endpoint mining di atas (atau tombol
-  `Claim` sebagai fallback). Tidak pernah: Connect Wallet, Sign,
-  Approve, Mint, Buy, Send, Mystery Box, ganti alamat.
+- Bot **hanya** menyentuh endpoint mining, check-in & baca-board di
+  atas (atau tombol `Claim` sebagai fallback). Tidak pernah: Connect
+  Wallet, Sign, Approve, Mint, Buy, Send, Mystery Box, ganti alamat.
+  Check-in yang sudah tercatat (`checkinToday == true`) tidak pernah
+  di-POST ulang; field API yang hilang = `PARSE_GAGAL`, bukan tebakan.
 - API menjawab `FROZEN` → bot berhenti & melapor, tidak memaksa.
 - Sesi mati (401) → bot berhenti & melapor `SESI_MATI` (jalankan `login.py` lagi).
 - `--dry-run` untuk cek tanpa claim apa pun.
@@ -95,8 +115,13 @@ kena 403 di mode ini, pakai mode browser (`login.py`) di VPS itu.
 python3 dhorse_claim.py --selftest          # uji parser (tanpa browser)
 python3 dhorse_claim.py --once --dry-run    # cek state saja
 python3 dhorse_claim.py --once --inspect    # + simpan snapshot & network log
-python3 dhorse_claim.py --once              # claim bila claimable >= 1
+python3 dhorse_claim.py --once              # check-in + claim bila >= 1 + board
+python3 dhorse_claim.py --board-only        # rank/power saja (publik)
+python3 dhorse_claim.py --cookie --board-only  # board + rank pribadimu
 ```
+
+Di mode `--loop`, board dicetak pada siklus pertama, tiap 6 siklus
+(±30 menit), dan tepat sesudah check-in berhasil — biar log tidak banjir.
 
 Jaga 24 jam pakai `screen`:
 
@@ -120,6 +145,9 @@ Semua request jaringan ke situs tercatat di `inspect/network.jsonl`
 | `--interval 300` | tempo dasar polling (detik) |
 | `--headed` | tampilkan browser (debug) |
 | `--dry-run` | jangan klik, hanya lapor |
+| `--no-checkin` | matikan daily check-in |
+| `--no-board` | matikan laporan rank/power |
+| `--board-only` | cetak board lalu berhenti (tanpa `--cookie`: versi publik) |
 
 ## Troubleshooting
 

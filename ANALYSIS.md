@@ -135,3 +135,87 @@ seperti UI resmi), dengan klik tombol Claim di UI sebagai fallback.
 Pagar: hanya dua endpoint mining itu yang disentuh, verifikasi status
 sesudah claim, maksimum 1 claim per siklus, berhenti total bila 401 /
 FROZEN / halaman minta tanda tangan wallet.
+
+## Update 17 Nov 2026 — Daily Check-in & Board (perintah Bos)
+
+Bos melaporkan update situs: daily check-in di `/`, auto-claim tetap di
+`/mine`, cek rank/power di `/board`. Recon ulang gaya REA atas bundle
+**produksi hari ini**:
+
+- Shell SPA didapat lewat fallback SPA (path tak dikenal mengembalikan
+  `index.html` tanpa tantangan Cloudflare yang memblokir `/` dari VM
+  agen) → bundle saat ini `/assets/index-Bse_Z7JS.js`, **438.746 byte,
+  SHA-256 `ab77d8e3b307fc75cfb21f21b57f091bc0f6153907b5fd08cca7bb94dfbda036`**
+  (beda dari bundle 12 Nov `index-B78mJdG7.js`).
+- Run REA formal (`analyze-javascript-application`, CLI rea-agents)
+  selesai: **Evidence ID
+  `ev_353b1f44bb5a309f3de1eddaf4482b80b5d39b6cc9194cbdc99969cdc1f66800`**,
+  dengan limitation standar REA bahwa cakupan grafiknya tidak lengkap.
+  Kesimpulan di bawah bersandar pada ekstraksi string/konteks bundle
+  secara langsung + verifikasi live, sama seperti putaran 12 Nov.
+
+### Observasi (bundle + live)
+
+1. **Daily check-in**: komponen UI di halaman utama membaca state dari
+   `GET /api/me` → field `checkinToday` (bool) & `checkinDays` (int).
+   Aksi tombol: `POST /api/checkin` body `"{}"` lewat wrapper fetch yang
+   sama persis dengan mining (`credentials:"same-origin"`, header
+   `content-type: application/json` saat ada body, **tanpa Turnstile /
+   token apa pun**). Teks UI resmi (EN): *"Daily Check-in — Check in
+   every day for 20 horseshoes"*, tombol *"Check in +20"*, sesudah
+   berhasil *"20 horseshoes added to your pending"*, *"Checked in
+   today"*, *"N days checked in"*. Sesudah POST, UI memanggil ulang
+   `/api/me` untuk verifikasi — bot meniru persis. Terverifikasi live
+   tanpa login: `POST /api/checkin` → **401 `NOT_SIGNED_IN`** (auth =
+   cookie sesi saja).
+2. **Board `/board`** punya 2 tab:
+   - *Horseshoes*: `GET /api/leaderboard` → `{rows: 50×{handle, tier,
+     points}, me: {rank}}`. Terverifikasi live tanpa login: 50 baris,
+     `me: null` (dengan cookie sesi, `me.rank` = rank Horseshoes
+     sendiri). Top saat recon: @01573bit 200.408 poin.
+   - *Power*: `GET /api/mining/network` → `{miners, scanning, scanned,
+     totalPower, top: 50×{handle, power}}`. Terverifikasi live:
+     miners 41.567, totalPower 11.244.365, top @HougeSol 7.420.
+   - Rank power **sendiri** tidak ada di dua endpoint itu — UI
+     mengambilnya dari `GET /api/mining/status` field **`networkRank`**
+     (+ `effectivePower`); status kini juga membawa `networkPower`,
+     `networkShare`, `blockSeconds` (UI: countdown =
+     `blocksLeft × (blockSeconds || 600)`). Parser lama belum
+     menangkap field-field ini; sekarang ditangkap.
+3. Wrapper API kedua (`Ne`, dipakai mining status) juga fetch
+   same-origin polos; error berbentuk `{error: CODE, state: …}` dengan
+   kode yang dikenal UI: `NOT_SIGNED_IN`, `NOT_MUSTERED`, `NOT_LIVE`,
+   `FROZEN`.
+
+### Inferensi
+
+- Batas "hari" check-in adalah hari server (kemungkinan UTC/UTC+8 —
+  tidak dinyatakan di bundle). Bot tidak menebaknya: ia membaca
+  `checkinToday` tiap siklus (±5 menit) dan POST hanya saat `false`,
+  jadi pergantian hari server kapan pun tertangkap selama loop jalan.
+- Respons sukses `POST /api/checkin` tidak dibaca UI selain status
+  (UI langsung refresh `/api/me`), jadi bentuk body suksesnya tidak
+  kritis; bot memverifikasi lewat `/api/me` seperti UI.
+
+### Unknown (jujur)
+
+- Bentuk persis `me` di `/api/leaderboard` selain `rank` (UI hanya
+  memakai `.rank`) dan body sukses `POST /api/checkin` — keduanya
+  hanya bisa dilihat dengan sesi login asli (di VPS Bos), dan bot
+  sudah menangani keduanya secara generik + verifikasi ulang.
+- Perilaku server bila POST check-in dipanggil dua kali (UI menonaktifkan
+  tombolnya; bot tidak pernah memanggil saat `checkinToday == true`).
+
+### Perubahan bot (commit sesudah e0e3dec)
+
+- `run_cookie_checkin()` + langkah check-in mode browser: state
+  `/api/me` → POST `/api/checkin` sekali → verifikasi `/api/me`.
+- `fetch_board()` + `parse_board()` + `--board-only`: rank Horseshoes
+  (`leaderboard.me.rank` / posisi Top 50), rank power (`networkRank`),
+  top & statistik network. Di `--loop`: siklus 1, tiap 6 siklus, dan
+  sesudah check-in berhasil. Flag `--no-checkin` / `--no-board`.
+- Uji: `py_compile` OK, `--selftest` OK (fixture me/leaderboard/network
+  baru), `--board-only` publik LIVE OK (angka cocok API mentah),
+  cookie palsu → `SESI_MATI` di `/api/me`, tanpa POST apa pun.
+  E2E check-in/claim dengan sesi asli tetap di VPS Bos, seperti
+  putaran sebelumnya.

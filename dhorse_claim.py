@@ -44,11 +44,29 @@ MODE API (hasil REA 12 Nov 2026, dari JS bundle resmi situs):
     kadens historis 72 blok) hanya dipakai untuk mempercepat polling,
     bukan sebagai jam pasti.
 
+UPDATE 17 Nov 2026 (REA bundle index-Bse_Z7JS.js, lihat ANALYSIS.md):
+  * DAILY CHECK-IN di halaman utama (/):  GET /api/me memberi state
+    checkinToday/checkinDays; aksinya POST /api/checkin body "{}" ->
+    +20 Horseshoes ke pending. Auth cookie sesi saja, TANPA Turnstile
+    (persis pola mining claim). Bot check-in sekali per hari server:
+    tiap siklus baca /api/me, POST hanya bila checkinToday == false,
+    lalu verifikasi ulang /api/me.
+  * BOARD (/board): tab Horseshoes = GET /api/leaderboard
+    {rows[50]{handle,tier,points}, me{rank}}; tab Power =
+    GET /api/mining/network {miners,totalPower,top[50]{handle,power}};
+    rank power sendiri = field networkRank di GET /api/mining/status
+    (field baru, parser lama belum menangkapnya). Bot melaporkan rank
+    Horseshoes + rank/power tiap siklus --once, dan berkala di --loop.
+  * Matikan per fitur: --no-checkin / --no-board. --board-only untuk
+    cetak board saja (tanpa cookie pun bisa: versi publik, rank
+    pribadi kosong).
+
 Pakai:
   python3 dhorse_claim.py --once --dry-run     # cek saja, tanpa klik
-  python3 dhorse_claim.py --once               # cek + claim bila >= 1
+  python3 dhorse_claim.py --once               # check-in + claim bila >= 1 + board
   python3 dhorse_claim.py --loop               # jaga terus (untuk screen)
   python3 dhorse_claim.py --once --inspect     # simpan snapshot teks+network
+  python3 dhorse_claim.py --board-only         # cetak rank/power saja
   python3 dhorse_claim.py --selftest           # uji parser tanpa browser
 """
 from __future__ import annotations
@@ -133,7 +151,7 @@ def banner(mode: str, min_claim: float, interval: int, loop: bool, dry: bool) ->
     tempo = f"{interval // 60} mnt" if interval >= 60 else f"{interval} dtk"
     log_block([
         "╔══════════════════════════════════════════════════════════╗",
-        "║  🐴 DARKHORSE GENESIS — AUTO-CLAIM HORSESHOES            ║",
+        "║  🐴 DARKHORSE GENESIS — CLAIM + CHECK-IN + BOARD          ║",
         "╚══════════════════════════════════════════════════════════╝",
         f"Mode {mode} · claim otomatis ≥ {fmt_num(min_claim, 1)} · cek tiap {tempo}"
         + (" · LOOP 24 jam" if loop else " · sekali jalan")
@@ -159,6 +177,10 @@ class MineState:
     tip_height: int | None = None       # tipHeight (tinggi blok BTC terakhir)
     daily_rate: float | None = None     # dailyRate (Horseshoes/hari)
     via_api: bool = False
+    # --- field BARU di /api/mining/status (bundle 17 Nov 2026, dipakai UI /board & /mine)
+    network_rank: int | None = None     # networkRank = rank power sendiri se-network
+    network_power: float | None = None  # networkPower = total power network (snapshot status)
+    block_seconds: int | None = None    # blockSeconds = detik per blok utk countdown
 
     def blocks_left(self) -> int | None:
         if self.blocks_left_api is not None:
@@ -183,6 +205,15 @@ def parse_status_json(data: dict) -> MineState:
         st.minutes_left_hint = st.blocks_left_api * 10
     if isinstance(data.get("tipHeight"), (int, float)):
         st.tip_height = int(data["tipHeight"])
+    if isinstance(data.get("networkRank"), (int, float)):
+        st.network_rank = int(data["networkRank"])
+    if isinstance(data.get("networkPower"), (int, float)):
+        st.network_power = float(data["networkPower"])
+    if isinstance(data.get("blockSeconds"), (int, float)):
+        st.block_seconds = int(data["blockSeconds"])
+        if st.blocks_left_api is not None:
+            # countdown UI resmi = blocksLeft * (blockSeconds || 600)
+            st.minutes_left_hint = int(st.blocks_left_api * st.block_seconds / 60)
     if isinstance(data.get("dailyRate"), (int, float)):
         st.daily_rate = float(data["dailyRate"])
     if isinstance(data.get("claimed"), (int, float)):
@@ -199,6 +230,125 @@ def parse_status_json(data: dict) -> MineState:
         st.raw_found += f" riwayat_burn_total={burned}"
     st.raw_found += f" api claimable={st.claimable} blocksLeft={st.blocks_left_api} tip={st.tip_height}"
     return st
+
+
+@dataclass
+class MeState:
+    """State akun dari GET /api/me (field yang benar-benar dipakai UI resmi)."""
+    logged_in: bool = False
+    handle: str | None = None           # handle X akun
+    checkin_today: bool | None = None   # checkinToday: sudah check-in hari server ini?
+    checkin_days: int | None = None     # checkinDays: total hari check-in
+    mustered: bool | None = None        # mustered: sudah muster alamat BTC?
+    has_wallet: bool = False            # walletAddress terisi?
+
+
+def parse_me_json(data: dict) -> MeState:
+    me = MeState(logged_in=True)
+    if isinstance(data.get("handle"), str) and data["handle"]:
+        me.handle = data["handle"]
+    if isinstance(data.get("checkinToday"), bool):
+        me.checkin_today = data["checkinToday"]
+    if isinstance(data.get("checkinDays"), (int, float)):
+        me.checkin_days = int(data["checkinDays"])
+    if isinstance(data.get("mustered"), bool):
+        me.mustered = data["mustered"]
+    me.has_wallet = bool(data.get("walletAddress"))
+    return me
+
+
+@dataclass
+class BoardState:
+    """Ringkasan /board: rank Horseshoes (leaderboard) + rank Power (network)."""
+    hs_rank: int | None = None          # /api/leaderboard -> me.rank
+    hs_points: float | None = None      # poin sendiri bila ketemu (me.points / baris sendiri)
+    hs_top_handle: str | None = None
+    hs_top_points: float | None = None
+    hs_in_top: int | None = None        # posisi (1-based) bila handle sendiri ada di rows Top 50
+    power_rank: int | None = None       # /api/mining/status -> networkRank
+    power: float | None = None          # effectivePower sendiri
+    power_top_handle: str | None = None
+    power_top: float | None = None
+    power_in_top: int | None = None
+    miners: int | None = None
+    total_power: float | None = None
+
+
+def parse_board(leaderboard: dict | None, network: dict | None,
+                handle: str | None, st: MineState | None) -> BoardState:
+    b = BoardState()
+    if isinstance(leaderboard, dict):
+        rows = leaderboard.get("rows") if isinstance(leaderboard.get("rows"), list) else []
+        if rows and isinstance(rows[0], dict):
+            b.hs_top_handle = rows[0].get("handle")
+            if isinstance(rows[0].get("points"), (int, float)):
+                b.hs_top_points = float(rows[0]["points"])
+        me = leaderboard.get("me")
+        if isinstance(me, dict):
+            if isinstance(me.get("rank"), (int, float)):
+                b.hs_rank = int(me["rank"])
+            if isinstance(me.get("points"), (int, float)):
+                b.hs_points = float(me["points"])
+        if handle:
+            for i, r in enumerate(rows):
+                if isinstance(r, dict) and str(r.get("handle", "")).lower() == handle.lower():
+                    b.hs_in_top = i + 1
+                    if isinstance(r.get("points"), (int, float)):
+                        b.hs_points = float(r["points"])
+                    if b.hs_rank is None:
+                        b.hs_rank = i + 1
+                    break
+    if isinstance(network, dict):
+        if isinstance(network.get("miners"), (int, float)):
+            b.miners = int(network["miners"])
+        if isinstance(network.get("totalPower"), (int, float)):
+            b.total_power = float(network["totalPower"])
+        top = network.get("top") if isinstance(network.get("top"), list) else []
+        if top and isinstance(top[0], dict):
+            b.power_top_handle = top[0].get("handle")
+            if isinstance(top[0].get("power"), (int, float)):
+                b.power_top = float(top[0]["power"])
+        if handle:
+            for i, r in enumerate(top):
+                if isinstance(r, dict) and str(r.get("handle", "")).lower() == handle.lower():
+                    b.power_in_top = i + 1
+                    break
+    if st is not None:
+        if st.network_rank is not None:
+            b.power_rank = st.network_rank
+        if st.power is not None:
+            b.power = st.power
+        if b.power_rank is None and b.power_in_top is not None:
+            b.power_rank = b.power_in_top
+    return b
+
+
+def board_lines(b: BoardState, handle: str | None) -> list[str]:
+    who = f" @{handle}" if handle else ""
+    hs = f"#{fmt_num(b.hs_rank, 0)}" if b.hs_rank is not None else "di luar Top 50 / belum berperingkat"
+    if b.hs_points is not None:
+        hs += f" · {fmt_num(b.hs_points, 0)} Horseshoes"
+    if b.hs_in_top is not None:
+        hs += f" · tampil di Top 50 (#{b.hs_in_top})"
+    pw = f"#{fmt_num(b.power_rank, 0)}" if b.power_rank is not None else "belum ada rank dari API"
+    if b.power is not None:
+        pw += f" · power {fmt_num(b.power, 0)}"
+    if b.power_in_top is not None:
+        pw += f" · tampil di Top 50 (#{b.power_in_top})"
+    lines = [f"📊 BOARD{who} — 🏆 Horseshoes: {hs}",
+             f"   ⚡ Power: {pw}"]
+    net = []
+    if b.hs_top_handle:
+        net.append(f"Top HS @{b.hs_top_handle} {fmt_num(b.hs_top_points, 0)}")
+    if b.power_top_handle:
+        net.append(f"Top Power @{b.power_top_handle} {fmt_num(b.power_top, 0)}")
+    if b.miners is not None:
+        net.append(f"miners {fmt_num(b.miners, 0)}")
+    if b.total_power is not None:
+        net.append(f"total power {fmt_num(b.total_power, 0)}")
+    if net:
+        lines.append("   🌐 " + " · ".join(net))
+    return lines
 
 
 def _num(s: str) -> float:
@@ -309,9 +459,12 @@ def _json_field_names(obj, prefix="", out=None, depth=0):
 
 
 class ClaimBot:
-    def __init__(self, headless: bool = True, inspect: bool = False):
+    def __init__(self, headless: bool = True, inspect: bool = False,
+                 do_checkin_feature: bool = True, show_board: bool = True):
         self.headless = headless
         self.inspect = inspect
+        self.do_checkin_feature = do_checkin_feature
+        self.show_board = show_board
         self.net_log_path = os.path.join(INSPECT_DIR, "network.jsonl")
         os.makedirs(INSPECT_DIR, exist_ok=True)
         os.makedirs(PROFILE_DIR, exist_ok=True)
@@ -400,6 +553,16 @@ class ClaimBot:
                     "(login sekali, sesi disimpan lokal). Bot berhenti siklus ini, tidak klik apa pun.")
                 ctx.close()
                 return st
+
+            # ---- DAILY CHECK-IN + BOARD (fitur 17 Nov 2026, pola API sama)
+            me_b: MeState | None = None
+            if self.do_checkin_feature:
+                me_b, ck_note = self._checkin_step(page, do_write=do_claim)
+                if ck_note == "SESI_MATI":
+                    ctx.close()
+                    return MineState(logged_in=False)
+            if self.show_board:
+                self._board_step(page, st, me_b.handle if me_b else None)
 
             if st.claimable is None:
                 log("PARSE_GAGAL: angka claimable tidak terbaca (API maupun DOM). "
@@ -522,6 +685,82 @@ class ClaimBot:
             return None, "FROZEN"
         return None, f"http-{r.get('status')} error={code}"
 
+    def _api_fetch(self, page, path: str, method: str = "GET"):
+        """Fetch same-origin generik dari dalam halaman login (pola UI resmi).
+        Return (status:int, body:dict|None)."""
+        try:
+            r = page.evaluate(
+                """async ([path, method]) => {
+                    const opts = {credentials:'same-origin', cache:'no-store'};
+                    if (method === 'POST') {
+                        opts.method = 'POST';
+                        opts.headers = {'content-type':'application/json'};
+                        opts.body = '{}';
+                    }
+                    const resp = await fetch(path, opts);
+                    let body = null;
+                    try { body = await resp.json(); } catch(e) {}
+                    return {status: resp.status, body};
+                }""", [path, method])
+        except Exception as e:
+            return 0, {"error": f"eval-gagal: {e}"}
+        if not isinstance(r, dict):
+            return 0, None
+        return int(r.get("status") or 0), r.get("body")
+
+    def _checkin_step(self, page, do_write: bool):
+        """Daily check-in mode browser. Return (MeState|None, note)."""
+        status, body = self._api_fetch(page, "/api/me")
+        if status == 401:
+            log("SESI_MATI: /api/me 401. Bot berhenti siklus ini.")
+            return None, "SESI_MATI"
+        if status != 200 or not isinstance(body, dict):
+            log(f"CHECKIN_SKIP: /api/me HTTP {status} — check-in dilewati siklus ini.")
+            return None, f"http-{status}"
+        me = parse_me_json(body)
+        if me.checkin_today is None:
+            log("PARSE_GAGAL (check-in): checkinToday tidak ada di /api/me; tidak ditebak.")
+            return me, "PARSE_GAGAL"
+        days_txt = f" · total {me.checkin_days} hari" if me.checkin_days is not None else ""
+        if me.checkin_today:
+            log(f"📅 Daily check-in: SUDAH hari ini{days_txt}.")
+            return me, "SUDAH"
+        if not do_write:
+            log(f"📅 DRY-RUN: check-in BELUM hari ini{days_txt} — seharusnya POST /api/checkin (+20). Tidak dikirim.")
+            return me, "DRY"
+        c_status, c_body = self._api_fetch(page, "/api/checkin", method="POST")
+        err = c_body.get("error") if isinstance(c_body, dict) else None
+        if c_status == 401:
+            return me, "SESI_MATI"
+        if c_status == 200:
+            s2, b2 = self._api_fetch(page, "/api/me")
+            if s2 == 200 and isinstance(b2, dict):
+                me2 = parse_me_json(b2)
+                if me2.checkin_today:
+                    d2 = f" · total {me2.checkin_days} hari" if me2.checkin_days is not None else ""
+                    log(f"📅✅ CHECKIN_BERHASIL: +20 Horseshoes masuk pending{d2} (terverifikasi).")
+                    return me2, "BERHASIL"
+            log("📅✅ CHECKIN_TERKIRIM: POST 200, verifikasi belum menegaskan; tidak POST ulang siklus ini.")
+            return me, "BERHASIL"
+        if err and ("ALREADY" in str(err).upper() or "CHECKED" in str(err).upper()):
+            log(f"📅 Daily check-in: server menjawab {err} — dianggap SUDAH.")
+            return me, "SUDAH"
+        if err == "FROZEN":
+            log("BLOCKER: akun FROZEN menurut API check-in.")
+            return me, "FROZEN"
+        log(f"📅 CHECKIN_GAGAL: HTTP {c_status} error={err}")
+        return me, "GAGAL"
+
+    def _board_step(self, page, st: MineState, handle: str | None) -> None:
+        s_lb, b_lb = self._api_fetch(page, "/api/leaderboard")
+        s_nw, b_nw = self._api_fetch(page, "/api/mining/network")
+        if s_lb != 200 and s_nw != 200:
+            log(f"BOARD_GAGAL: leaderboard HTTP {s_lb}, network HTTP {s_nw}.")
+            return
+        b = parse_board(b_lb if s_lb == 200 else None,
+                        b_nw if s_nw == 200 else None, handle, st)
+        log_block(board_lines(b, handle))
+
     def _click_claim(self, page) -> bool:
         """Satu-satunya aksi klik bot ini. Konservatif:
         - hanya di genesis.dhorse.fun/mine
@@ -573,10 +812,21 @@ epoch 61 37/72 CLAIMABLE 12.3456 CLAIMED 14 power 110 Claim
 API_FIXTURE = {
     "live": True, "claimable": 12.3456, "blocksLeft": 35, "tipHeight": 970937,
     "dailyRate": 24.64, "claimed": 1300, "effectivePower": 110,
+    "networkRank": 4321, "networkPower": 11244365, "blockSeconds": 600,
     "epochIndex": 60, "boostLabel": "knight",
     "history": [{"epochIndex": 59, "burned": 0, "at": "2026-11-12 06:59:00"},
                 {"epochIndex": 58, "burned": 3.5, "at": "2026-11-11 18:59:00"}],
 }
+
+
+ME_FIXTURE = {"handle": "Didinska0610", "checkinToday": False, "checkinDays": 6,
+              "mustered": True, "walletAddress": "bc1pfixture"}
+LB_FIXTURE = {"rows": [{"handle": "01573bit", "tier": "partner", "points": 200408},
+                       {"handle": "Didinska0610", "tier": "knight", "points": 1234}],
+              "me": {"rank": 777}}
+NET_FIXTURE = {"miners": 41567, "totalPower": 11244365,
+               "top": [{"handle": "HougeSol", "power": 7420},
+                       {"handle": "didinska0610", "power": 110}]}
 
 
 def selftest() -> int:
@@ -585,6 +835,15 @@ def selftest() -> int:
     assert abs(sa.claimable - 12.3456) < 1e-9 and sa.blocks_left() == 35, sa
     assert sa.minutes_left_hint == 350 and sa.tip_height == 970937, sa
     assert sa.epoch == 61 and sa.claimed_total == 1300, sa
+    assert sa.network_rank == 4321 and sa.network_power == 11244365, sa
+    me = parse_me_json(ME_FIXTURE)
+    assert me.logged_in and me.handle == "Didinska0610", me
+    assert me.checkin_today is False and me.checkin_days == 6 and me.mustered, me
+    bd = parse_board(LB_FIXTURE, NET_FIXTURE, me.handle, sa)
+    assert bd.hs_rank == 777 and bd.hs_points == 1234 and bd.hs_in_top == 2, bd
+    assert bd.hs_top_handle == "01573bit" and bd.power_rank == 4321, bd
+    assert bd.power_in_top == 2 and bd.miners == 41567, bd
+    assert board_lines(bd, me.handle), bd
     s1 = parse_mine_text(FIXTURE_1)
     assert s1.logged_in and abs((s1.claimable or 0) - 0.78) < 1e-9, s1
     assert s1.minutes_left_hint == 4, s1
@@ -655,14 +914,16 @@ def load_cookie() -> str | None:
     return None
 
 
-def _http_api(cookie: str, method: str, path: str, body: bytes | None = None):
+def _http_api(cookie: str | None, method: str, path: str, body: bytes | None = None,
+              referer: str | None = None):
     import urllib.request
     import urllib.error
     req = urllib.request.Request(BASE + path, data=body, method=method)
-    req.add_header("Cookie", cookie)
+    if cookie:
+        req.add_header("Cookie", cookie)
     req.add_header("User-Agent", load_ua())
     req.add_header("Accept", "application/json")
-    req.add_header("Referer", MINE_URL)
+    req.add_header("Referer", referer or MINE_URL)
     if body is not None:
         req.add_header("Content-Type", "application/json")
         req.add_header("Origin", BASE)
@@ -713,6 +974,9 @@ def run_cookie_cycle(cookie: str, do_claim: bool, min_claim: float) -> MineState
         f" · ✅ claimed {fmt_num(st.claimed_total, 1)}"
         f" · ⚡ power {fmt_num(st.power, 0)}"
         f" · 📈 {fmt_num(st.daily_rate, 1)}/hari{_burn}")
+    if st.network_rank is not None:
+        _lines.append(f"   🏆 Rank power se-network: #{fmt_num(st.network_rank, 0)}"
+                      + (f" · total power network {fmt_num(st.network_power, 0)}" if st.network_power else ""))
     if st.claimable is not None and st.claimable < min_claim:
         _lines.append(f"   Target  {bar(st.claimable, min_claim, 10)} menuju {fmt_num(min_claim, 1)}")
     log_block(_lines)
@@ -753,6 +1017,93 @@ def run_cookie_cycle(cookie: str, do_claim: bool, min_claim: float) -> MineState
     return st
 
 
+# ------------------------------------------------- daily check-in & board
+# Daily Check-in (halaman utama /): state dari GET /api/me
+# (checkinToday/checkinDays), aksi POST /api/checkin body "{}" -> +20
+# Horseshoes ke pending (teks UI resmi: "20 horseshoes added to your
+# pending"). Wrapper fetch UI sama persis dengan mining claim:
+# same-origin + content-type json, TANPA Turnstile/token. "Hari" di sini
+# hari SERVER — bot tidak menebak batas harinya; ia membaca checkinToday
+# tiap siklus dan POST hanya saat nilainya false, jadi pergantian hari
+# server otomatis tertangkap kapan pun loop berjalan.
+
+def run_cookie_checkin(cookie: str, do_checkin: bool) -> tuple[str, MeState | None]:
+    """Return (outcome, me). outcome: SUDAH | BERHASIL | DRY | GAGAL |
+    FROZEN | PARSE_GAGAL | SESI_MATI | BLOCKER."""
+    status, body = _http_api(cookie, "GET", "/api/me", referer=BASE + "/")
+    if status == 401:
+        log("SESI_MATI (cookie): /api/me 401 NOT_SIGNED_IN — cookie habis/dicabut. "
+            "Ambil cookie baru sekali lewat export_cookie.py, perbarui .env.")
+        return "SESI_MATI", None
+    if status == 403:
+        log("BLOCKER (cookie): 403 Cloudflare saat /api/me — cf_clearance tidak cocok "
+            "dengan IP/UA VPS ini. Pakai mode browser (login.py) di VPS ini.")
+        return "BLOCKER", None
+    if status != 200 or not isinstance(body, dict):
+        log(f"BLOCKER (cookie): /api/me HTTP {status} body={str(body)[:200]}")
+        return "BLOCKER", None
+    me = parse_me_json(body)
+    if me.checkin_today is None:
+        log("PARSE_GAGAL (check-in): field checkinToday tidak ada di /api/me — "
+            "bentuk API berubah; check-in TIDAK ditebak/dipaksa. Lapor snapshot /api/me ke Bos.")
+        return "PARSE_GAGAL", me
+    days_txt = f" · total {me.checkin_days} hari" if me.checkin_days is not None else ""
+    if me.checkin_today:
+        log(f"📅 Daily check-in: SUDAH hari ini{days_txt}. Tidak ada aksi.")
+        return "SUDAH", me
+    if not do_checkin:
+        log(f"📅 DRY-RUN: daily check-in BELUM hari ini{days_txt} — seharusnya POST "
+            "/api/checkin sekarang (+20 Horseshoes). Tidak dikirim.")
+        return "DRY", me
+    c_status, c_body = _http_api(cookie, "POST", "/api/checkin", body=b"{}", referer=BASE + "/")
+    if c_status == 401:
+        log("SESI_MATI (cookie): POST /api/checkin 401 — sesi mati di tengah siklus.")
+        return "SESI_MATI", me
+    err = c_body.get("error") if isinstance(c_body, dict) else None
+    if c_status == 200:
+        # verifikasi persis cara UI: panggil ulang /api/me
+        s2, b2 = _http_api(cookie, "GET", "/api/me", referer=BASE + "/")
+        if s2 == 200 and isinstance(b2, dict):
+            me2 = parse_me_json(b2)
+            if me2.checkin_today:
+                d2 = f" · total {me2.checkin_days} hari" if me2.checkin_days is not None else ""
+                log(f"📅✅ CHECKIN_BERHASIL: +20 Horseshoes masuk pending{d2} "
+                    f"(terverifikasi checkinToday=true).")
+                return "BERHASIL", me2
+        log("📅✅ CHECKIN_TERKIRIM: POST /api/checkin menjawab 200, tapi verifikasi "
+            "/api/me belum menegaskan checkinToday=true — cek manual sekali; bot tidak POST ulang siklus ini.")
+        return "BERHASIL", me
+    if err and ("ALREADY" in str(err).upper() or "CHECKED" in str(err).upper()):
+        log(f"📅 Daily check-in: server menjawab {err} — dianggap SUDAH hari ini.")
+        return "SUDAH", me
+    if err == "FROZEN":
+        log("BLOCKER: akun FROZEN menurut API check-in. Berhenti check-in; cek akun di situs.")
+        return "FROZEN", me
+    log(f"📅 CHECKIN_GAGAL: HTTP {c_status} error={err} body={str(c_body)[:200]}")
+    return "GAGAL", me
+
+
+def fetch_board(cookie: str | None, handle: str | None = None,
+                st: MineState | None = None) -> BoardState | None:
+    """Baca /board persis cara UI: GET /api/leaderboard (tab Horseshoes)
+    + GET /api/mining/network (tab Power) + rank power dari status mining.
+    Dua endpoint pertama PUBLIK — tanpa cookie pun jalan (rank pribadi
+    kosong). Bila handle belum diketahui dan ada cookie, ambil dari /api/me."""
+    if handle is None and cookie:
+        s_me, b_me = _http_api(cookie, "GET", "/api/me", referer=BASE + "/board")
+        if s_me == 200 and isinstance(b_me, dict):
+            handle = parse_me_json(b_me).handle
+    s_lb, b_lb = _http_api(cookie, "GET", "/api/leaderboard", referer=BASE + "/board")
+    s_nw, b_nw = _http_api(cookie, "GET", "/api/mining/network", referer=BASE + "/board")
+    if s_lb != 200 and s_nw != 200:
+        log(f"BOARD_GAGAL: leaderboard HTTP {s_lb}, network HTTP {s_nw}.")
+        return None
+    b = parse_board(b_lb if s_lb == 200 else None,
+                    b_nw if s_nw == 200 else None, handle, st)
+    log_block(board_lines(b, handle))
+    return b
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> int:
@@ -767,6 +1118,13 @@ def main() -> int:
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--cookie", action="store_true",
                     help="mode HTTP murni memakai DHORSE_COOKIE dari env/.env (tanpa browser)")
+    ap.add_argument("--no-checkin", action="store_true",
+                    help="matikan daily check-in (default: aktif, +20/hari)")
+    ap.add_argument("--no-board", action="store_true",
+                    help="matikan laporan rank/power /board (default: aktif)")
+    ap.add_argument("--board-only", action="store_true",
+                    help="cetak board (rank Horseshoes + power) lalu berhenti; "
+                         "tanpa --cookie jalan versi publik tanpa login")
     args = ap.parse_args()
 
     if args.selftest:
@@ -777,6 +1135,15 @@ def main() -> int:
     if not args.once and not args.loop:
         args.once = True
 
+    if args.board_only:
+        # Board publik: dua endpoint-nya tidak butuh login; dengan cookie
+        # rank pribadi ikut tampil. Tidak ada aksi tulis apa pun di sini.
+        cookie = load_cookie() if args.cookie else None
+        if args.cookie and not cookie:
+            log("Info: DHORSE_COOKIE tidak ada — board versi publik (rank pribadi kosong).")
+        b = fetch_board(cookie)
+        return 0 if b is not None else 2
+
     if args.cookie:
         cookie = load_cookie()
         if not cookie:
@@ -786,11 +1153,31 @@ def main() -> int:
             return 2
         banner("cookie (HTTP murni, tanpa browser)", args.min_claim, args.interval,
                loop=args.loop, dry=args.dry_run)
+        cycle_no = 0
         while True:
-            st = run_cookie_cycle(cookie, do_claim=not args.dry_run, min_claim=args.min_claim)
+            cycle_no += 1
+            dead = False
+            me_handle: str | None = None
+            ck_outcome: str | None = None
+            if not args.no_checkin:
+                ck_outcome, me_state = run_cookie_checkin(cookie, do_checkin=not args.dry_run)
+                if me_state is not None:
+                    me_handle = me_state.handle
+                if ck_outcome == "SESI_MATI":
+                    dead = True
+            st = None
+            if not dead:
+                st = run_cookie_cycle(cookie, do_claim=not args.dry_run, min_claim=args.min_claim)
+                if st is not None and not st.logged_in:
+                    dead = True
+            if not args.no_board and not dead:
+                # --once: selalu. --loop: siklus pertama, tiap 6 siklus
+                # (±30 mnt), dan tepat sesudah check-in berhasil.
+                if args.once or cycle_no == 1 or cycle_no % 6 == 0 or ck_outcome == "BERHASIL":
+                    fetch_board(cookie, handle=me_handle, st=st)
             if args.once:
                 return 0
-            if st is not None and not st.logged_in:
+            if dead:
                 log("Loop cookie berhenti: sesi mati.")
                 return 2
             sleep_s = args.interval
@@ -805,7 +1192,9 @@ def main() -> int:
             log(f"⏳ Cek lagi {_human} lagi ...")
             time.sleep(sleep_s)
 
-    bot = ClaimBot(headless=not args.headed, inspect=args.inspect)
+    bot = ClaimBot(headless=not args.headed, inspect=args.inspect,
+                   do_checkin_feature=not args.no_checkin,
+                   show_board=not args.no_board)
     while True:
         st = bot.run_cycle(do_claim=not args.dry_run, min_claim=args.min_claim)
         if args.once:
